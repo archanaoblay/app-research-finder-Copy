@@ -608,7 +608,7 @@ def run_search(
             max_results=max_results,
 
             backend=(
-                "google, brave, duckduckgo"
+                "yahoo"
             )
 
         )
