@@ -158,7 +158,7 @@ def clean_input(value):
     value = str(value).strip()
     if value.lower() in ["nan", "none", "null", "n/a", "na", "-"]:
         return ""
-return value
+    return value
 
 
 def normalize_website(url):
