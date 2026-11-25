@@ -389,9 +389,10 @@ def score_candidate(
             score += 4
             reasons.append("Developer 1 partially matches")
 
-if d2 and len(d2) >= 3:
+    if d2 and len(d2) >= 3:
         words = [x for x in d2.split() if len(x) >= 3]
         matched = sum(1 for word in words if word in all_text)
+
         if matched >= 2:
             score += 6
             reasons.append("Developer 2 strongly matches")
@@ -410,7 +411,7 @@ if d2 and len(d2) >= 3:
         if developer_email_domain in href.lower() or clean_domain in all_text:
             score += 7
             reasons.append("Developer email domain matches")
-
+            
     for username, label in [
         (support_username, "Support email username"),
         (developer_username, "Developer email username"),
