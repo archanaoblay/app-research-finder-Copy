@@ -18,6 +18,7 @@ import requests
 import tldextract
 from bs4 import BeautifulSoup
 from ddgs import DDGS
+from google_play_scraper import app as google_play_app
 
 # ============================================================
 # 3. SUPPRESS WARNINGS / LOGS
@@ -2079,6 +2080,58 @@ def process_app(
 
 
 
+# ----------------------------- GOOGLE PLAY ENRICHMENT -----------------------------
+
+GOOGLE_PLAY_CACHE = {}
+GOOGLE_PLAY_COUNTRIES = ["in", "us"]
+
+
+def get_google_play_details(bundle_id):
+    """Fetch public app listing metadata from Google Play only."""
+    bundle_id = clean_input(bundle_id)
+    if not bundle_id:
+        return {}, "missing_bundle_id"
+    cache_key = bundle_id.lower()
+    if cache_key in GOOGLE_PLAY_CACHE:
+        return GOOGLE_PLAY_CACHE[cache_key], "cache_hit"
+    last_error = "not_found"
+    for country in GOOGLE_PLAY_COUNTRIES:
+        try:
+            details = google_play_app(bundle_id, lang="en", country=country, timeout=20)
+            if details:
+                GOOGLE_PLAY_CACHE[cache_key] = details
+                return details, "found"
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {str(exc)[:250]}"
+            print(f"Google Play lookup ({country}) failed for {bundle_id}: {last_error}")
+            time.sleep(1)
+    return {}, last_error
+
+
+def enrich_from_google_play(row):
+    """Fill missing fields from Google Play while preserving supplied values."""
+    bundle_id = clean_input(row.get("bundle_id"))
+    details, lookup_status = get_google_play_details(bundle_id)
+    enriched = {
+        "developer_1": clean_input(row.get("developer_1")) or clean_input(details.get("developer")),
+        # Google Play does not provide a second developer entity; never infer one.
+        "developer_2": clean_input(row.get("developer_2")),
+        "website": clean_input(row.get("website")) or clean_input(details.get("developerWebsite")),
+        "support_email": clean_input(row.get("support_email")) or clean_input(details.get("developerEmail")),
+        "developer_email": clean_input(row.get("developer_email")) or clean_input(details.get("developerEmail")),
+    }
+    metadata = {
+        "google_play_app_name": clean_input(details.get("title")),
+        "google_play_developer": clean_input(details.get("developer")),
+        "google_play_developer_id": clean_input(details.get("developerId")),
+        "google_play_developer_website": clean_input(details.get("developerWebsite")),
+        "google_play_developer_email": clean_input(details.get("developerEmail")),
+        "google_play_lookup_status": lookup_status,
+        "google_play_url": f"https://play.google.com/store/apps/details?id={urllib.parse.quote(bundle_id)}",
+    }
+    return enriched, metadata
+
+
 # ----------------------------- CLOUD CONFIG -----------------------------
 
 BATCH_SIZE = 25
@@ -2147,6 +2200,20 @@ def fetch_pending_rows():
     return db_request("GET", "research_apps", params=params) or []
 
 
+def save_google_play_enrichment(app_id, original_input_data, metadata, enriched):
+    merged = dict(original_input_data) if isinstance(original_input_data, dict) else {}
+    merged.update(metadata)
+    payload = {
+        "input_data": merged,
+        "developer_1": enriched.get("developer_1", ""),
+        "developer_2": enriched.get("developer_2", ""),
+        "website": enriched.get("website", ""),
+        "support_email": enriched.get("support_email", ""),
+        "developer_email": enriched.get("developer_email", ""),
+    }
+    db_request("PATCH", "research_apps", params={"id": f"eq.{app_id}"}, payload=payload)
+
+
 def save_app_result(app_id, result, status="completed", error_message=None):
     payload = {
         "status": status,
@@ -2186,11 +2253,22 @@ def main():
         for row in rows:
             app_id = row["id"]
             bundle_id = clean_input(row.get("bundle_id"))
-            developer1 = clean_input(row.get("developer_1"))
-            developer2 = clean_input(row.get("developer_2"))
-            website = clean_input(row.get("website"))
-            support_email = clean_input(row.get("support_email"))
-            developer_email = clean_input(row.get("developer_email"))
+            try:
+                enriched, google_play_metadata = enrich_from_google_play(row)
+                developer1 = enriched["developer_1"]
+                developer2 = enriched["developer_2"]
+                website = enriched["website"]
+                support_email = enriched["support_email"]
+                developer_email = enriched["developer_email"]
+                save_google_play_enrichment(app_id, row.get("input_data"), google_play_metadata, enriched)
+                print(f"   Google Play: {google_play_metadata.get('google_play_lookup_status')} | App: {google_play_metadata.get('google_play_app_name')}")
+            except Exception as enrichment_exc:
+                print(f"Google Play enrichment error for {bundle_id}: {enrichment_exc}")
+                developer1 = clean_input(row.get("developer_1"))
+                developer2 = clean_input(row.get("developer_2"))
+                website = clean_input(row.get("website"))
+                support_email = clean_input(row.get("support_email"))
+                developer_email = clean_input(row.get("developer_email"))
 
             print(f"\\n[{processed_this_run + 1}] Processing {bundle_id}")
             print(f"   Developer 1: {developer1}")
