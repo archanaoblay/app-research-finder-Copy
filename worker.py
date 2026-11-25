@@ -1,7 +1,8 @@
 # ============================================================
 # APP RESEARCH FINDER - CLOUD WORKER
-# Preserves the original LinkedIn discovery, scoring and confidence logic.
-# Input/output and progress are handled by Supabase instead of Colab files.
+# Original LinkedIn discovery, scoring, confidence and matching logic
+# ported from BULK LINKEDIN COMPANY FINDER.
+# Only Colab file handling is replaced by Supabase/GitHub Actions.
 # ============================================================
 
 import os
@@ -11,26 +12,2075 @@ import random
 import logging
 import warnings
 import urllib.parse
-from typing import Any
 
+import pandas as pd
 import requests
 import tldextract
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 
+# ============================================================
+# 3. SUPPRESS WARNINGS / LOGS
+# ============================================================
+
 warnings.filterwarnings("ignore")
+
 logging.getLogger("ddgs").setLevel(logging.ERROR)
+logging.getLogger("ddgs.ddgs").setLevel(logging.ERROR)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
 
-# ----------------------------- SETTINGS -----------------------------
+
+# ============================================================
+# 4. SETTINGS
+# ============================================================
 
 REQUEST_TIMEOUT = 6
 SEARCH_TIMEOUT = 6
+
 MAX_RESULTS = 6
+
+# ------------------------------------------------------------
+# FASTER DELAYS
+# ------------------------------------------------------------
+
 MIN_APP_DELAY = 0.5
 MAX_APP_DELAY = 1.0
+
 SEARCH_DELAY = 0.15
+
+# ------------------------------------------------------------
+# SEARCH CONTROL
+# ------------------------------------------------------------
+
 EARLY_STOP_SCORE = 12
+
+# ------------------------------------------------------------
+# SAVE EVERY 10 APPS
+# ------------------------------------------------------------
+
+SAVE_EVERY = 10
+
+PROGRESS_FILE = (
+    "/content/"
+    "LinkedIn_Company_Finder_Progress.xlsx"
+)
+
+FINAL_FILE = (
+    "/content/"
+    "LinkedIn_Company_Finder_Final.xlsx"
+)
+
+# ------------------------------------------------------------
+# WEBSITE PAGES
+# ------------------------------------------------------------
+
+WEBSITE_PATHS = [
+    "",
+    "about",
+    "about-us",
+    "aboutus",
+    "company",
+    "contact",
+    "contact-us"
+]
+
+
+# ============================================================
+# 5. SESSION
+# ============================================================
+
+session = requests.Session()
+
+session.headers.update({
+
+    "User-Agent": (
+        "Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/155.0 Safari/537.36"
+    ),
+
+    "Accept-Language":
+        "en-US,en;q=0.9"
+
+})
+
+
+# ============================================================
+# 6. CACHES
+# ============================================================
+
+WEBSITE_LINKEDIN_CACHE = {}
+
+SEARCH_CACHE = {}
+
+COMPANY_RESULT_CACHE = {}
+
+LINKEDIN_WEBSITE_CACHE = {}
+
+
+# ============================================================
+# 7. FREE EMAIL DOMAINS
+# ============================================================
+
+FREE_EMAIL_DOMAINS = {
+
+    "gmail.com",
+    "googlemail.com",
+    "yahoo.com",
+    "yahoo.co.in",
+    "hotmail.com",
+    "outlook.com",
+    "live.com",
+    "icloud.com",
+    "proton.me",
+    "protonmail.com",
+    "aol.com",
+    "mail.com",
+    "gmx.com",
+    "rediffmail.com"
+
+}
+
+
+# ============================================================
+# 8. CLEAN INPUT
+# ============================================================
+
+def clean_input(value):
+
+    if value is None:
+        return ""
+
+    try:
+
+        if pd.isna(value):
+            return ""
+
+    except Exception:
+        pass
+
+    value = str(value).strip()
+
+    if value.lower() in [
+        "nan",
+        "none",
+        "null",
+        "n/a",
+        "na",
+        "-"
+    ]:
+
+        return ""
+
+    return value
+
+
+# ============================================================
+# 9. NORMALIZE WEBSITE
+# ============================================================
+
+def normalize_website(url):
+
+    url = clean_input(url)
+
+    if not url:
+        return ""
+
+    if not url.startswith(
+        ("http://", "https://")
+    ):
+
+        url = "https://" + url
+
+    try:
+
+        parsed = urllib.parse.urlparse(
+            url
+        )
+
+        if not parsed.netloc:
+            return ""
+
+        return (
+            f"{parsed.scheme}://"
+            f"{parsed.netloc}"
+        ).rstrip("/")
+
+    except Exception:
+
+        return ""
+
+
+# ============================================================
+# 10. ROOT DOMAIN
+# ============================================================
+
+def root_domain(url):
+
+    url = clean_input(url)
+
+    if not url:
+        return ""
+
+    try:
+
+        if not url.startswith(
+            ("http://", "https://")
+        ):
+
+            url = "https://" + url
+
+        parsed = urllib.parse.urlparse(
+            url
+        )
+
+        host = parsed.netloc.lower()
+
+        host = host.split("@")[-1]
+        host = host.split(":")[0]
+
+        extracted = tldextract.extract(
+            host
+        )
+
+        if not extracted.domain:
+            return ""
+
+        if not extracted.suffix:
+            return extracted.domain.lower()
+
+        return (
+            extracted.domain
+            + "."
+            + extracted.suffix
+        ).lower()
+
+    except Exception:
+
+        return ""
+
+
+# ============================================================
+# 11. NORMALIZE EMAIL
+# ============================================================
+
+def normalize_email(email):
+
+    email = clean_input(email)
+
+    if not email:
+        return ""
+
+    email = email.lower().strip()
+
+    match = re.search(
+        r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}",
+        email,
+        re.I
+    )
+
+    if match:
+        return match.group(0).lower()
+
+    return email
+
+
+# ============================================================
+# 12. EMAIL DOMAIN
+# ============================================================
+
+def email_domain(email):
+
+    email = normalize_email(
+        email
+    )
+
+    if "@" not in email:
+        return ""
+
+    return (
+        email.split("@")[-1]
+        .strip()
+        .lower()
+    )
+
+
+# ============================================================
+# 13. EMAIL USERNAME
+# ============================================================
+
+def email_username(email):
+
+    email = normalize_email(
+        email
+    )
+
+    if "@" not in email:
+        return ""
+
+    return (
+        email.split("@")[0]
+        .lower()
+    )
+
+
+# ============================================================
+# 14. LINKEDIN COMPANY URL
+# ============================================================
+
+def extract_linkedin_company(url):
+
+    url = clean_input(url)
+
+    if not url:
+        return ""
+
+    url = url.replace(
+        "\\/",
+        "/"
+    )
+
+    patterns = [
+
+        r"https?://(?:www\.)?"
+        r"linkedin\.com/company/"
+        r"[A-Za-z0-9%_\-./]+",
+
+        r"https?://(?:[a-z]{2,3}\.)?"
+        r"linkedin\.com/company/"
+        r"[A-Za-z0-9%_\-./]+"
+
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            url,
+            re.I
+        )
+
+        if match:
+
+            result = match.group(0)
+
+            result = result.rstrip(
+                ".,);]}>'\""
+            )
+
+            match2 = re.match(
+                r"(https?://(?:www\.)?"
+                r"linkedin\.com/company/"
+                r"[^/?#]+)",
+                result,
+                re.I
+            )
+
+            if match2:
+
+                result = (
+                    match2.group(1)
+                )
+
+            return result.rstrip("/")
+
+    return ""
+
+
+# ============================================================
+# 15. FETCH WEBSITE
+# ============================================================
+
+def fetch_url(url):
+
+    try:
+
+        response = session.get(
+
+            url,
+
+            timeout=REQUEST_TIMEOUT,
+
+            allow_redirects=True
+
+        )
+
+        if response.status_code >= 400:
+            return None
+
+        return response
+
+    except Exception:
+
+        return None
+
+
+# ============================================================
+# 16. FIND LINKEDIN DIRECTLY FROM WEBSITE
+# ============================================================
+
+def search_website_directly(
+    website
+):
+
+    website = normalize_website(
+        website
+    )
+
+    if not website:
+        return []
+
+    if website in WEBSITE_LINKEDIN_CACHE:
+
+        return WEBSITE_LINKEDIN_CACHE[
+            website
+        ]
+
+    found = []
+
+    urls_to_check = []
+
+    # Homepage
+    urls_to_check.append(
+        website
+    )
+
+    # Internal pages
+    for path in WEBSITE_PATHS:
+
+        if path == "":
+            continue
+
+        urls_to_check.append(
+
+            website.rstrip("/")
+            + "/"
+            + path
+
+        )
+
+    urls_to_check = list(
+        dict.fromkeys(
+            urls_to_check
+        )
+    )
+
+    # --------------------------------------------------------
+    # CHECK WEBSITE PAGES
+    # --------------------------------------------------------
+
+    for url in urls_to_check:
+
+        try:
+
+            response = fetch_url(
+                url
+            )
+
+            if response is None:
+                continue
+
+            html = response.text
+
+            # Raw HTML
+            linkedin = (
+                extract_linkedin_company(
+                    html
+                )
+            )
+
+            if linkedin:
+
+                found.append({
+
+                    "linkedin":
+                        linkedin,
+
+                    "source_url":
+                        url,
+
+                    "method":
+                        "WEBSITE_DIRECT"
+
+                })
+
+                break
+
+            # Actual links
+            soup = BeautifulSoup(
+                html,
+                "html.parser"
+            )
+
+            for a in soup.find_all(
+                "a",
+                href=True
+            ):
+
+                href = a.get(
+                    "href",
+                    ""
+                )
+
+                linkedin = (
+                    extract_linkedin_company(
+                        href
+                    )
+                )
+
+                if linkedin:
+
+                    found.append({
+
+                        "linkedin":
+                            linkedin,
+
+                        "source_url":
+                            url,
+
+                        "method":
+                            "WEBSITE_DIRECT"
+
+                    })
+
+                    break
+
+            if found:
+                break
+
+        except Exception:
+            continue
+
+    WEBSITE_LINKEDIN_CACHE[
+        website
+    ] = found
+
+    return found
+
+
+# ============================================================
+# 17. SEARCH ENGINE
+# ============================================================
+
+def run_search(
+    query,
+    max_results=MAX_RESULTS
+):
+
+    query = clean_input(
+        query
+    )
+
+    if not query:
+        return []
+
+    cache_key = (
+        query.lower(),
+        max_results
+    )
+
+    if cache_key in SEARCH_CACHE:
+
+        return SEARCH_CACHE[
+            cache_key
+        ]
+
+    try:
+
+        time.sleep(
+            SEARCH_DELAY
+        )
+
+        ddgs = DDGS(
+            timeout=SEARCH_TIMEOUT
+        )
+
+        results = ddgs.text(
+
+            query,
+
+            region="wt-wt",
+
+            safesearch="off",
+
+            max_results=max_results,
+
+            backend=(
+                "google, brave, duckduckgo"
+            )
+
+        )
+
+        results = list(
+            results or []
+        )
+
+        SEARCH_CACHE[
+            cache_key
+        ] = results
+
+        return results
+
+    except Exception as exc:
+
+        # Keep the original fallback behaviour, but expose the real search
+        # provider error in Actions logs instead of silently reporting NOT FOUND.
+        print(
+            f"      SEARCH ERROR for query {query!r}: "
+            f"{type(exc).__name__}: {str(exc)[:500]}"
+        )
+
+        SEARCH_CACHE[
+            cache_key
+        ] = []
+
+        return []
+
+
+# ============================================================
+# 18. EXTRACT LINKEDIN FROM SEARCH RESULTS
+# ============================================================
+
+def linkedin_from_search_results(
+    results
+):
+
+    candidates = []
+
+    for result in results:
+
+        if not isinstance(
+            result,
+            dict
+        ):
+            continue
+
+        title = clean_input(
+            result.get(
+                "title",
+                ""
+            )
+        )
+
+        href = clean_input(
+            result.get(
+                "href",
+                ""
+            )
+        )
+
+        body = clean_input(
+            result.get(
+                "body",
+                ""
+            )
+        )
+
+        text = (
+            title
+            + " "
+            + href
+            + " "
+            + body
+        )
+
+        linkedin = (
+            extract_linkedin_company(
+                text
+            )
+        )
+
+        if linkedin:
+
+            candidates.append({
+
+                "linkedin":
+                    linkedin,
+
+                "title":
+                    title,
+
+                "href":
+                    href,
+
+                "body":
+                    body
+
+            })
+
+    return candidates
+
+
+# ============================================================
+# 19. LINKEDIN SLUG
+# ============================================================
+
+def linkedin_slug(
+    linkedin
+):
+
+    linkedin = clean_input(
+        linkedin
+    )
+
+    if not linkedin:
+        return ""
+
+    match = re.search(
+
+        r"linkedin\.com/company/"
+        r"([^/?#]+)",
+
+        linkedin,
+
+        re.I
+
+    )
+
+    if not match:
+        return ""
+
+    return (
+
+        urllib.parse.unquote(
+            match.group(1)
+        )
+
+        .replace("-", " ")
+
+        .replace("_", " ")
+
+        .strip()
+
+        .lower()
+
+    )
+
+
+# ============================================================
+# 20. NORMALIZE NAME
+# ============================================================
+
+def normalize_name(
+    value
+):
+
+    value = clean_input(
+        value
+    )
+
+    value = value.lower()
+
+    value = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        value
+    )
+
+    value = re.sub(
+        r"\s+",
+        " ",
+        value
+    )
+
+    return value.strip()
+
+
+# ============================================================
+# 21. SCORE CANDIDATE
+# ============================================================
+
+def score_candidate(
+
+    linkedin,
+
+    developer1,
+
+    developer2,
+
+    website,
+
+    support_email,
+
+    developer_email,
+
+    title="",
+
+    href="",
+
+    body="",
+
+    found_via=""
+
+):
+
+    score = 0
+
+    reasons = []
+
+    linkedin_slug_value = (
+        linkedin_slug(
+            linkedin
+        )
+    )
+
+    d1 = normalize_name(
+        developer1
+    )
+
+    d2 = normalize_name(
+        developer2
+    )
+
+    website_domain = root_domain(
+        website
+    )
+
+    support_domain = email_domain(
+        support_email
+    )
+
+    developer_email_domain = (
+        email_domain(
+            developer_email
+        )
+    )
+
+    support_username = (
+        email_username(
+            support_email
+        )
+    )
+
+    developer_username = (
+        email_username(
+            developer_email
+        )
+    )
+
+    all_text = normalize_name(
+
+        " ".join([
+
+            title,
+
+            href,
+
+            body,
+
+            linkedin_slug_value
+
+        ])
+
+    )
+
+    # --------------------------------------------------------
+    # WEBSITE DOMAIN
+    # --------------------------------------------------------
+
+    if website_domain:
+
+        website_domain_clean = (
+
+            website_domain
+
+            .replace(
+                ".",
+                " "
+            )
+
+            .replace(
+                "-",
+                " "
+            )
+
+        )
+
+        if (
+
+            website_domain
+            in href.lower()
+
+        ):
+
+            score += 8
+
+            reasons.append(
+                "Website domain matches candidate"
+            )
+
+        elif (
+            website_domain_clean
+            in all_text
+        ):
+
+            score += 8
+
+            reasons.append(
+                "Website domain appears in result"
+            )
+
+    # --------------------------------------------------------
+    # DEVELOPER 1
+    # --------------------------------------------------------
+
+    if d1 and len(d1) >= 3:
+
+        d1_words = [
+
+            x
+
+            for x in d1.split()
+
+            if len(x) >= 3
+
+        ]
+
+        matched = sum(
+
+            1
+
+            for word in d1_words
+
+            if word in all_text
+
+        )
+
+        if matched >= 2:
+
+            score += 8
+
+            reasons.append(
+                "Developer 1 strongly matches"
+            )
+
+        elif matched == 1:
+
+            score += 4
+
+            reasons.append(
+                "Developer 1 partially matches"
+            )
+
+    # --------------------------------------------------------
+    # DEVELOPER 2
+    # --------------------------------------------------------
+
+    if d2 and len(d2) >= 3:
+
+        d2_words = [
+
+            x
+
+            for x in d2.split()
+
+            if len(x) >= 3
+
+        ]
+
+        matched = sum(
+
+            1
+
+            for word in d2_words
+
+            if word in all_text
+
+        )
+
+        if matched >= 2:
+
+            score += 6
+
+            reasons.append(
+                "Developer 2 strongly matches"
+            )
+
+        elif matched == 1:
+
+            score += 3
+
+            reasons.append(
+                "Developer 2 partially matches"
+            )
+
+    # --------------------------------------------------------
+    # SUPPORT EMAIL DOMAIN
+    # --------------------------------------------------------
+
+    if (
+
+        support_domain
+
+        and
+
+        support_domain
+        not in FREE_EMAIL_DOMAINS
+
+    ):
+
+        support_domain_clean = (
+
+            support_domain
+
+            .replace(
+                ".",
+                " "
+            )
+
+            .replace(
+                "-",
+                " "
+            )
+
+        )
+
+        if (
+
+            support_domain
+            in href.lower()
+
+            or
+
+            support_domain_clean
+            in all_text
+
+        ):
+
+            score += 7
+
+            reasons.append(
+                "Support email domain matches"
+            )
+
+    # --------------------------------------------------------
+    # DEVELOPER EMAIL DOMAIN
+    # --------------------------------------------------------
+
+    if (
+
+        developer_email_domain
+
+        and
+
+        developer_email_domain
+        not in FREE_EMAIL_DOMAINS
+
+    ):
+
+        dev_domain_clean = (
+
+            developer_email_domain
+
+            .replace(
+                ".",
+                " "
+            )
+
+            .replace(
+                "-",
+                " "
+            )
+
+        )
+
+        if (
+
+            developer_email_domain
+            in href.lower()
+
+            or
+
+            dev_domain_clean
+            in all_text
+
+        ):
+
+            score += 7
+
+            reasons.append(
+                "Developer email domain matches"
+            )
+
+    # --------------------------------------------------------
+    # EMAIL USERNAME
+    # --------------------------------------------------------
+
+    for username, label in [
+
+        (
+            support_username,
+            "Support email username"
+        ),
+
+        (
+            developer_username,
+            "Developer email username"
+        )
+
+    ]:
+
+        if (
+
+            username
+
+            and
+
+            len(username) >= 4
+
+            and
+
+            username in all_text
+
+        ):
+
+            score += 2
+
+            reasons.append(
+                label + " matches"
+            )
+
+    # --------------------------------------------------------
+    # VALID LINKEDIN COMPANY
+    # --------------------------------------------------------
+
+    if (
+
+        "linkedin.com/company/"
+        in linkedin.lower()
+
+    ):
+
+        score += 2
+
+        reasons.append(
+            "Valid LinkedIn company URL"
+        )
+
+    # --------------------------------------------------------
+    # DIRECT WEBSITE FIND
+    # --------------------------------------------------------
+
+    if found_via == "WEBSITE_DIRECT":
+
+        score += 10
+
+        reasons.append(
+            "LinkedIn found directly on developer website"
+        )
+
+    return score, reasons
+
+
+# ============================================================
+# 22. FIND LINKEDIN CANDIDATES
+# ============================================================
+
+def find_candidates(
+
+    developer1,
+
+    developer2,
+
+    website,
+
+    support_email,
+
+    developer_email
+
+):
+
+    candidates = {}
+
+    website_domain = root_domain(
+        website
+    )
+
+    # --------------------------------------------------------
+    # QUERIES
+    # --------------------------------------------------------
+
+    queries = []
+
+    # Website/domain FIRST
+
+    if website_domain:
+
+        queries.append((
+
+            f'"{website_domain}" LinkedIn company',
+
+            "WEBSITE_DOMAIN"
+
+        ))
+
+        queries.append((
+
+            f'site:linkedin.com/company "{website_domain}"',
+
+            "WEBSITE_DOMAIN_LINKEDIN"
+
+        ))
+
+    # Developer 1
+
+    if developer1:
+
+        queries.append((
+
+            f'"{developer1}" LinkedIn company',
+
+            "DEVELOPER_1"
+
+        ))
+
+        queries.append((
+
+            f'site:linkedin.com/company "{developer1}"',
+
+            "DEVELOPER_1_LINKEDIN"
+
+        ))
+
+    # Developer 2
+
+    if developer2:
+
+        queries.append((
+
+            f'"{developer2}" LinkedIn company',
+
+            "DEVELOPER_2"
+
+        ))
+
+        queries.append((
+
+            f'site:linkedin.com/company "{developer2}"',
+
+            "DEVELOPER_2_LINKEDIN"
+
+        ))
+
+    # Support email
+
+    support_email = normalize_email(
+        support_email
+    )
+
+    if support_email:
+
+        support_domain = (
+            email_domain(
+                support_email
+            )
+        )
+
+        if (
+
+            support_domain
+
+            and
+
+            support_domain
+            not in FREE_EMAIL_DOMAINS
+
+        ):
+
+            queries.append((
+
+                f'"{support_domain}" LinkedIn company',
+
+                "SUPPORT_EMAIL_DOMAIN"
+
+            ))
+
+    # Developer email
+
+    developer_email = (
+        normalize_email(
+            developer_email
+        )
+    )
+
+    if developer_email:
+
+        developer_domain = (
+            email_domain(
+                developer_email
+            )
+        )
+
+        if (
+
+            developer_domain
+
+            and
+
+            developer_domain
+            not in FREE_EMAIL_DOMAINS
+
+        ):
+
+            queries.append((
+
+                f'"{developer_domain}" LinkedIn company',
+
+                "DEVELOPER_EMAIL_DOMAIN"
+
+            ))
+
+    # --------------------------------------------------------
+    # RUN QUERIES
+    # --------------------------------------------------------
+
+    for query, found_via in queries:
+
+        print(
+            f"      Search: {query}"
+        )
+
+        results = run_search(
+            query,
+            MAX_RESULTS
+        )
+
+        linkedin_results = (
+            linkedin_from_search_results(
+                results
+            )
+        )
+
+        for item in linkedin_results:
+
+            linkedin = item[
+                "linkedin"
+            ]
+
+            score, reasons = (
+                score_candidate(
+
+                    linkedin=linkedin,
+
+                    developer1=developer1,
+
+                    developer2=developer2,
+
+                    website=website,
+
+                    support_email=support_email,
+
+                    developer_email=developer_email,
+
+                    title=item[
+                        "title"
+                    ],
+
+                    href=item[
+                        "href"
+                    ],
+
+                    body=item[
+                        "body"
+                    ],
+
+                    found_via=found_via
+
+                )
+            )
+
+            if linkedin not in candidates:
+
+                candidates[
+                    linkedin
+                ] = {
+
+                    "linkedin":
+                        linkedin,
+
+                    "score":
+                        score,
+
+                    "reasons":
+                        reasons,
+
+                    "found_via":
+                        found_via,
+
+                    "title":
+                        item["title"],
+
+                    "href":
+                        item["href"],
+
+                    "body":
+                        item["body"],
+
+                    "matched_signal":
+                        query
+
+                }
+
+            else:
+
+                candidates[
+                    linkedin
+                ][
+                    "score"
+                ] += score
+
+                candidates[
+                    linkedin
+                ][
+                    "reasons"
+                ].extend(
+                    reasons
+                )
+
+        # ----------------------------------------------------
+        # EARLY STOP
+        # ----------------------------------------------------
+
+        best_score = max(
+
+            [
+                x["score"]
+                for x in candidates.values()
+            ],
+
+            default=0
+
+        )
+
+        if best_score >= EARLY_STOP_SCORE:
+
+            print(
+                f"      Strong candidate found "
+                f"(score {best_score})"
+            )
+
+            break
+
+    return list(
+        candidates.values()
+    )
+
+
+# ============================================================
+# 23. FIND LINKEDIN COMPANY WEBSITE
+# ============================================================
+
+def find_linkedin_website(
+    linkedin
+):
+
+    linkedin = clean_input(
+        linkedin
+    )
+
+    if not linkedin:
+        return ""
+
+    if linkedin in LINKEDIN_WEBSITE_CACHE:
+
+        return LINKEDIN_WEBSITE_CACHE[
+            linkedin
+        ]
+
+    slug = linkedin_slug(
+        linkedin
+    )
+
+    if not slug:
+
+        LINKEDIN_WEBSITE_CACHE[
+            linkedin
+        ] = ""
+
+        return ""
+
+    queries = [
+
+        f'"{linkedin}" website',
+
+        f'"{slug}" company website',
+
+        f'"{slug}" official website'
+
+    ]
+
+    found_website = ""
+
+    for query in queries:
+
+        results = run_search(
+            query,
+            5
+        )
+
+        for result in results:
+
+            href = clean_input(
+                result.get(
+                    "href",
+                    ""
+                )
+            )
+
+            if not href:
+                continue
+
+            # Skip LinkedIn
+            if (
+                "linkedin.com"
+                in href.lower()
+            ):
+                continue
+
+            href_domain = root_domain(
+                href
+            )
+
+            if not href_domain:
+                continue
+
+            # Skip social sites
+            skip_domains = [
+
+                "facebook.com",
+                "instagram.com",
+                "twitter.com",
+                "x.com",
+                "youtube.com",
+                "tiktok.com",
+                "crunchbase.com",
+                "glassdoor.com",
+                "indeed.com"
+
+            ]
+
+            if href_domain in skip_domains:
+                continue
+
+            if href.startswith(
+                (
+                    "http://",
+                    "https://"
+                )
+            ):
+
+                found_website = (
+                    normalize_website(
+                        href
+                    )
+                )
+
+                if found_website:
+                    break
+
+        if found_website:
+            break
+
+    LINKEDIN_WEBSITE_CACHE[
+        linkedin
+    ] = found_website
+
+    return found_website
+
+
+# ============================================================
+# 24. WEBSITE MATCH
+# ============================================================
+
+def website_match(
+
+    original_website,
+
+    linkedin_website
+
+):
+
+    original_domain = root_domain(
+        original_website
+    )
+
+    linkedin_domain = root_domain(
+        linkedin_website
+    )
+
+    if (
+
+        not original_domain
+
+        or
+
+        not linkedin_domain
+
+    ):
+
+        return "NOT VERIFIED"
+
+    if original_domain == linkedin_domain:
+
+        return "YES"
+
+    return "NO"
+
+
+# ============================================================
+# 25. CONFIDENCE
+# ============================================================
+
+def calculate_confidence(
+
+    score,
+
+    linkedin_website,
+
+    match
+
+):
+
+    if (
+
+        linkedin_website
+
+        and
+
+        match == "YES"
+
+    ):
+
+        return "VERY HIGH"
+
+    if (
+
+        linkedin_website
+
+        and
+
+        match == "NO"
+
+    ):
+
+        if score >= 15:
+            return "HIGH - WEBSITE MISMATCH"
+
+        elif score >= 8:
+            return "MEDIUM - WEBSITE MISMATCH"
+
+        else:
+            return "LOW - WEBSITE MISMATCH"
+
+    if score >= 20:
+        return "HIGH"
+
+    if score >= 12:
+        return "MEDIUM"
+
+    if score >= 6:
+        return "LOW - TOP MATCH"
+
+    return "VERY LOW - TOP MATCH"
+
+
+# ============================================================
+# 26. PROCESS ONE APP
+# ============================================================
+
+def process_app(
+
+    bundle_id,
+
+    developer1,
+
+    developer2,
+
+    website,
+
+    support_email,
+
+    developer_email
+
+):
+
+    bundle_id = clean_input(
+        bundle_id
+    )
+
+    developer1 = clean_input(
+        developer1
+    )
+
+    developer2 = clean_input(
+        developer2
+    )
+
+    website = normalize_website(
+        website
+    )
+
+    support_email = normalize_email(
+        support_email
+    )
+
+    developer_email = normalize_email(
+        developer_email
+    )
+
+    # --------------------------------------------------------
+    # CACHE KEY
+    # --------------------------------------------------------
+
+    cache_key = (
+
+        bundle_id.lower(),
+
+        developer1.lower(),
+
+        developer2.lower(),
+
+        website.lower(),
+
+        support_email.lower(),
+
+        developer_email.lower()
+
+    )
+
+    if cache_key in COMPANY_RESULT_CACHE:
+
+        cached = (
+            COMPANY_RESULT_CACHE[
+                cache_key
+            ].copy()
+        )
+
+        cached["Cache"] = "HIT"
+
+        return cached
+
+    # --------------------------------------------------------
+    # 1. WEBSITE DIRECT
+    # --------------------------------------------------------
+
+    direct_results = []
+
+    if website:
+
+        print(
+            "   Checking developer website..."
+        )
+
+        direct_results = (
+            search_website_directly(
+                website
+            )
+        )
+
+    # --------------------------------------------------------
+    # DIRECT LINKEDIN
+    # --------------------------------------------------------
+
+    if direct_results:
+
+        linkedin = (
+            direct_results[0][
+                "linkedin"
+            ]
+        )
+
+        found_via = (
+            "WEBSITE_DIRECT"
+        )
+
+        score, reasons = (
+            score_candidate(
+
+                linkedin=linkedin,
+
+                developer1=developer1,
+
+                developer2=developer2,
+
+                website=website,
+
+                support_email=support_email,
+
+                developer_email=developer_email,
+
+                title="",
+
+                href=linkedin,
+
+                body="",
+
+                found_via="WEBSITE_DIRECT"
+
+            )
+        )
+
+        score += 10
+
+        if (
+            "LinkedIn found directly on developer website"
+            not in reasons
+        ):
+
+            reasons.append(
+                "LinkedIn found directly on developer website"
+            )
+
+        matched_signal = website
+
+    else:
+
+        # ----------------------------------------------------
+        # 2. SEARCH
+        # ----------------------------------------------------
+
+        print(
+            "   Searching LinkedIn..."
+        )
+
+        candidates = find_candidates(
+
+            developer1=developer1,
+
+            developer2=developer2,
+
+            website=website,
+
+            support_email=support_email,
+
+            developer_email=developer_email
+
+        )
+
+        if not candidates:
+
+            result = {
+
+                "Bundle ID":
+                    bundle_id,
+
+                "Developer 1":
+                    developer1,
+
+                "Developer 2":
+                    developer2,
+
+                "Website":
+                    website,
+
+                "LinkedIn":
+                    "NOT FOUND",
+
+                "LinkedIn Website":
+                    "",
+
+                "Website Match":
+                    "NOT VERIFIED",
+
+                "Found Via":
+                    "",
+
+                "Matched Signal":
+                    "",
+
+                "Score":
+                    0,
+
+                "Confidence":
+                    "NOT FOUND",
+
+                "Reasons":
+                    "No LinkedIn company candidate found",
+
+                "Cache":
+                    "MISS"
+
+            }
+
+            COMPANY_RESULT_CACHE[
+                cache_key
+            ] = result.copy()
+
+            return result
+
+        # ----------------------------------------------------
+        # ALWAYS TOP CANDIDATE
+        # ----------------------------------------------------
+
+        candidates = sorted(
+
+            candidates,
+
+            key=lambda x:
+                x["score"],
+
+            reverse=True
+
+        )
+
+        best = candidates[0]
+
+        linkedin = best[
+            "linkedin"
+        ]
+
+        score = best[
+            "score"
+        ]
+
+        reasons = list(
+            dict.fromkeys(
+                best["reasons"]
+            )
+        )
+
+        found_via = best[
+            "found_via"
+        ]
+
+        matched_signal = best[
+            "matched_signal"
+        ]
+
+    # --------------------------------------------------------
+    # 3. LINKEDIN WEBSITE
+    # --------------------------------------------------------
+
+    print(
+        "   Checking LinkedIn website..."
+    )
+
+    linkedin_website = (
+        find_linkedin_website(
+            linkedin
+        )
+    )
+
+    # --------------------------------------------------------
+    # 4. WEBSITE MATCH
+    # --------------------------------------------------------
+
+    match = website_match(
+
+        website,
+
+        linkedin_website
+
+    )
+
+    # --------------------------------------------------------
+    # 5. CONFIDENCE
+    # --------------------------------------------------------
+
+    confidence = (
+        calculate_confidence(
+
+            score=score,
+
+            linkedin_website=
+                linkedin_website,
+
+            match=match
+
+        )
+    )
+
+    # --------------------------------------------------------
+    # REASON
+    # --------------------------------------------------------
+
+    if match == "YES":
+
+        reasons.append(
+            "LinkedIn website matches original website"
+        )
+
+    elif match == "NO":
+
+        reasons.append(
+            "LinkedIn website does not match original website"
+        )
+
+    else:
+
+        reasons.append(
+            "LinkedIn website could not be independently verified"
+        )
+
+    reasons = list(
+        dict.fromkeys(
+            reasons
+        )
+    )
+
+    # --------------------------------------------------------
+    # RESULT
+    # --------------------------------------------------------
+
+    result = {
+
+        "Bundle ID":
+            bundle_id,
+
+        "Developer 1":
+            developer1,
+
+        "Developer 2":
+            developer2,
+
+        "Website":
+            website,
+
+        "LinkedIn":
+            linkedin,
+
+        "LinkedIn Website":
+            linkedin_website,
+
+        "Website Match":
+            match,
+
+        "Found Via":
+            found_via,
+
+        "Matched Signal":
+            matched_signal,
+
+        "Score":
+            score,
+
+        "Confidence":
+            confidence,
+
+        "Reasons":
+            " | ".join(
+                reasons
+            ),
+
+        "Cache":
+            "MISS"
+
+    }
+
+    COMPANY_RESULT_CACHE[
+        cache_key
+    ] = result.copy()
+
+    return result
+
+
+
+
+
+# ----------------------------- CLOUD CONFIG -----------------------------
+
 BATCH_SIZE = 25
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
@@ -44,34 +2094,6 @@ HEADERS = {
     "Content-Type": "application/json",
     "Prefer": "return=minimal",
 }
-
-session = requests.Session()
-session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/155.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-})
-
-WEBSITE_LINKEDIN_CACHE = {}
-SEARCH_CACHE = {}
-COMPANY_RESULT_CACHE = {}
-LINKEDIN_WEBSITE_CACHE = {}
-
-FREE_EMAIL_DOMAINS = {
-    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.in",
-    "hotmail.com", "outlook.com", "live.com", "icloud.com",
-    "proton.me", "protonmail.com", "aol.com", "mail.com",
-    "gmx.com", "rediffmail.com"
-}
-
-OUTPUT_COLUMNS = [
-    "Bundle ID", "Developer 1", "Developer 2", "Website", "LinkedIn",
-    "LinkedIn Website", "Website Match", "Found Via", "Matched Signal",
-    "Score", "Confidence", "Reasons", "Cache"
-]
 
 
 # ----------------------------- SUPABASE -----------------------------
@@ -112,8 +2134,6 @@ def update_job(status=None, processed_rows=None):
 
 
 def fetch_pending_rows():
-    # Include both common initial states so the worker can process rows
-    # created by the app regardless of whether it labels them pending or queued.
     params = {
         "select": (
             "id,job_id,bundle_id,developer_1,developer_2,website,"
@@ -150,529 +2170,6 @@ def save_app_result(app_id, result, status="completed", error_message=None):
     )
 
 
-# ----------------------------- ORIGINAL HELPERS -----------------------------
-
-def clean_input(value):
-    if value is None:
-        return ""
-    value = str(value).strip()
-    if value.lower() in ["nan", "none", "null", "n/a", "na", "-"]:
-        return ""
-    return value
-
-
-def normalize_website(url):
-    url = clean_input(url)
-    if not url:
-        return ""
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    try:
-        parsed = urllib.parse.urlparse(url)
-        if not parsed.netloc:
-            return ""
-        return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
-    except Exception:
-        return ""
-
-
-def root_domain(url):
-    url = clean_input(url)
-    if not url:
-        return ""
-    try:
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-        parsed = urllib.parse.urlparse(url)
-        host = parsed.netloc.lower().split("@")[-1].split(":")[0]
-        extracted = tldextract.extract(host)
-        if not extracted.domain:
-            return ""
-        if not extracted.suffix:
-            return extracted.domain.lower()
-        return (extracted.domain + "." + extracted.suffix).lower()
-    except Exception:
-        return ""
-
-
-def normalize_email(email):
-    email = clean_input(email).lower().strip()
-    if not email:
-        return ""
-    match = re.search(
-        r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}",
-        email, re.I
-    )
-    return match.group(0).lower() if match else email
-
-
-def email_domain(email):
-    email = normalize_email(email)
-    return email.split("@")[-1].strip().lower() if "@" in email else ""
-
-
-def email_username(email):
-    email = normalize_email(email)
-    return email.split("@")[0].lower() if "@" in email else ""
-
-
-def extract_linkedin_company(url):
-    url = clean_input(url).replace("\\/", "/")
-    if not url:
-        return ""
-    patterns = [
-        r"https?://(?:www\.)?linkedin\.com/company/[A-Za-z0-9%_\-./]+",
-        r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/company/[A-Za-z0-9%_\-./]+",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url, re.I)
-        if match:
-            result = match.group(0).rstrip(".,);]}>'\"")
-            match2 = re.match(
-                r"(https?://(?:www\.)?linkedin\.com/company/[^/?#]+)",
-                result, re.I
-            )
-            if match2:
-                result = match2.group(1)
-            return result.rstrip("/")
-    return ""
-
-
-def fetch_url(url):
-    try:
-        response = session.get(
-            url, timeout=REQUEST_TIMEOUT, allow_redirects=True
-        )
-        return None if response.status_code >= 400 else response
-    except Exception:
-        return None
-
-
-def search_website_directly(website):
-    website = normalize_website(website)
-    if not website:
-        return []
-    if website in WEBSITE_LINKEDIN_CACHE:
-        return WEBSITE_LINKEDIN_CACHE[website]
-
-    found = []
-    urls_to_check = [website]
-    for path in ["about", "about-us", "aboutus", "company", "contact", "contact-us"]:
-        urls_to_check.append(website.rstrip("/") + "/" + path)
-
-    for url in dict.fromkeys(urls_to_check):
-        try:
-            response = fetch_url(url)
-            if response is None:
-                continue
-            linkedin = extract_linkedin_company(response.text)
-            if linkedin:
-                found.append({
-                    "linkedin": linkedin,
-                    "source_url": url,
-                    "method": "WEBSITE_DIRECT",
-                })
-                break
-
-            soup = BeautifulSoup(response.text, "html.parser")
-            for anchor in soup.find_all("a", href=True):
-                linkedin = extract_linkedin_company(anchor.get("href", ""))
-                if linkedin:
-                    found.append({
-                        "linkedin": linkedin,
-                        "source_url": url,
-                        "method": "WEBSITE_DIRECT",
-                    })
-                    break
-            if found:
-                break
-        except Exception:
-            continue
-
-    WEBSITE_LINKEDIN_CACHE[website] = found
-    return found
-
-
-def run_search(query, max_results=MAX_RESULTS):
-    query = clean_input(query)
-    if not query:
-        return []
-    cache_key = (query.lower(), max_results)
-    if cache_key in SEARCH_CACHE:
-        return SEARCH_CACHE[cache_key]
-    try:
-        time.sleep(SEARCH_DELAY)
-        ddgs = DDGS(timeout=SEARCH_TIMEOUT)
-        results = ddgs.text(
-            query,
-            region="wt-wt",
-            safesearch="off",
-            max_results=max_results,
-            backend="google, brave, duckduckgo",
-        )
-        results = list(results or [])
-        SEARCH_CACHE[cache_key] = results
-        return results
-    except Exception as exc:
-        print(f"Search unavailable for query ({type(exc).__name__}).")
-        SEARCH_CACHE[cache_key] = []
-        return []
-
-
-def linkedin_from_search_results(results):
-    candidates = []
-    for result in results:
-        if not isinstance(result, dict):
-            continue
-        title = clean_input(result.get("title", ""))
-        href = clean_input(result.get("href", ""))
-        body = clean_input(result.get("body", ""))
-        linkedin = extract_linkedin_company(title + " " + href + " " + body)
-        if linkedin:
-            candidates.append({
-                "linkedin": linkedin,
-                "title": title,
-                "href": href,
-                "body": body,
-            })
-    return candidates
-
-
-def linkedin_slug(linkedin):
-    linkedin = clean_input(linkedin)
-    match = re.search(r"linkedin\.com/company/([^/?#]+)", linkedin, re.I)
-    if not match:
-        return ""
-    return (
-        urllib.parse.unquote(match.group(1))
-        .replace("-", " ").replace("_", " ").strip().lower()
-    )
-
-
-def normalize_name(value):
-    value = clean_input(value).lower()
-    value = re.sub(r"[^a-z0-9]+", " ", value)
-    return re.sub(r"\s+", " ", value).strip()
-
-
-# ----------------------------- ORIGINAL SCORING -----------------------------
-
-def score_candidate(
-    linkedin, developer1, developer2, website, support_email,
-    developer_email, title="", href="", body="", found_via=""
-):
-    score = 0
-    reasons = []
-    slug = linkedin_slug(linkedin)
-    d1 = normalize_name(developer1)
-    d2 = normalize_name(developer2)
-    website_domain = root_domain(website)
-    support_domain = email_domain(support_email)
-    developer_email_domain = email_domain(developer_email)
-    support_username = email_username(support_email)
-    developer_username = email_username(developer_email)
-    all_text = normalize_name(" ".join([title, href, body, slug]))
-
-    if website_domain:
-        clean_domain = website_domain.replace(".", " ").replace("-", " ")
-        if website_domain in href.lower() or clean_domain in all_text:
-            score += 8
-            reasons.append("Website domain matches candidate")
-
-    if d1 and len(d1) >= 3:
-        words = [x for x in d1.split() if len(x) >= 3]
-        matched = sum(1 for word in words if word in all_text)
-        if matched >= 2:
-            score += 8
-            reasons.append("Developer 1 strongly matches")
-        elif matched == 1:
-            score += 4
-            reasons.append("Developer 1 partially matches")
-
-    if d2 and len(d2) >= 3:
-        words = [x for x in d2.split() if len(x) >= 3]
-        matched = sum(1 for word in words if word in all_text)
-
-        if matched >= 2:
-            score += 6
-            reasons.append("Developer 2 strongly matches")
-        elif matched == 1:
-            score += 3
-            reasons.append("Developer 2 partially matches")
-
-    if support_domain and support_domain not in FREE_EMAIL_DOMAINS:
-        clean_domain = support_domain.replace(".", " ").replace("-", " ")
-        if support_domain in href.lower() or clean_domain in all_text:
-            score += 7
-            reasons.append("Support email domain matches")
-
-    if developer_email_domain and developer_email_domain not in FREE_EMAIL_DOMAINS:
-        clean_domain = developer_email_domain.replace(".", " ").replace("-", " ")
-        if developer_email_domain in href.lower() or clean_domain in all_text:
-            score += 7
-            reasons.append("Developer email domain matches")
-            
-    for username, label in [
-        (support_username, "Support email username"),
-        (developer_username, "Developer email username"),
-    ]:
-        if username and len(username) >= 4 and username in all_text:
-            score += 2
-            reasons.append(label + " matches")
-
-    if "linkedin.com/company/" in linkedin.lower():
-        score += 2
-        reasons.append("Valid LinkedIn company URL")
-
-    if found_via == "WEBSITE_DIRECT":
-        score += 10
-        reasons.append("LinkedIn found directly on developer website")
-
-    return score, reasons
-
-
-def find_candidates(developer1, developer2, website, support_email, developer_email):
-    candidates = {}
-    domain = root_domain(website)
-    queries = []
-
-    if domain:
-        queries.extend([
-            (f'"{domain}" LinkedIn company', "WEBSITE_DOMAIN"),
-            (f'site:linkedin.com/company "{domain}"', "WEBSITE_DOMAIN_LINKEDIN"),
-        ])
-    if developer1:
-        queries.extend([
-            (f'"{developer1}" LinkedIn company', "DEVELOPER_1"),
-            (f'site:linkedin.com/company "{developer1}"', "DEVELOPER_1_LINKEDIN"),
-        ])
-    if developer2:
-        queries.extend([
-            (f'"{developer2}" LinkedIn company', "DEVELOPER_2"),
-            (f'site:linkedin.com/company "{developer2}"', "DEVELOPER_2_LINKEDIN"),
-        ])
-
-    support_email = normalize_email(support_email)
-    support_domain = email_domain(support_email)
-    if support_domain and support_domain not in FREE_EMAIL_DOMAINS:
-        queries.append((f'"{support_domain}" LinkedIn company', "SUPPORT_EMAIL_DOMAIN"))
-
-    developer_email = normalize_email(developer_email)
-    developer_domain = email_domain(developer_email)
-    if developer_domain and developer_domain not in FREE_EMAIL_DOMAINS:
-        queries.append((f'"{developer_domain}" LinkedIn company', "DEVELOPER_EMAIL_DOMAIN"))
-
-    for query, found_via in queries:
-        print(f"      Search: {query}")
-        results = linkedin_from_search_results(run_search(query, MAX_RESULTS))
-        for item in results:
-            linkedin = item["linkedin"]
-            score, reasons = score_candidate(
-                linkedin=linkedin,
-                developer1=developer1,
-                developer2=developer2,
-                website=website,
-                support_email=support_email,
-                developer_email=developer_email,
-                title=item["title"],
-                href=item["href"],
-                body=item["body"],
-                found_via=found_via,
-            )
-            if linkedin not in candidates:
-                candidates[linkedin] = {
-                    "linkedin": linkedin,
-                    "score": score,
-                    "reasons": reasons,
-                    "found_via": found_via,
-                    "title": item["title"],
-                    "href": item["href"],
-                    "body": item["body"],
-                    "matched_signal": query,
-                }
-            else:
-                candidates[linkedin]["score"] += score
-                candidates[linkedin]["reasons"].extend(reasons)
-
-        best_score = max((x["score"] for x in candidates.values()), default=0)
-        if best_score >= EARLY_STOP_SCORE:
-            print(f"      Strong candidate found (score {best_score})")
-            break
-
-    return list(candidates.values())
-
-
-def find_linkedin_website(linkedin):
-    linkedin = clean_input(linkedin)
-    if not linkedin:
-        return ""
-    if linkedin in LINKEDIN_WEBSITE_CACHE:
-        return LINKEDIN_WEBSITE_CACHE[linkedin]
-
-    slug = linkedin_slug(linkedin)
-    if not slug:
-        LINKEDIN_WEBSITE_CACHE[linkedin] = ""
-        return ""
-
-    queries = [
-        f'"{linkedin}" website',
-        f'"{slug}" company website',
-        f'"{slug}" official website',
-    ]
-    found_website = ""
-    skip_domains = {
-        "facebook.com", "instagram.com", "twitter.com", "x.com",
-        "youtube.com", "tiktok.com", "crunchbase.com", "glassdoor.com",
-        "indeed.com",
-    }
-
-    for query in queries:
-        for result in run_search(query, 5):
-            href = clean_input(result.get("href", ""))
-            if not href or "linkedin.com" in href.lower():
-                continue
-            href_domain = root_domain(href)
-            if not href_domain or href_domain in skip_domains:
-                continue
-            if href.startswith(("http://", "https://")):
-                found_website = normalize_website(href)
-                if found_website:
-                    break
-        if found_website:
-            break
-
-    LINKEDIN_WEBSITE_CACHE[linkedin] = found_website
-    return found_website
-
-
-def website_match(original_website, linkedin_website):
-    original_domain = root_domain(original_website)
-    linkedin_domain = root_domain(linkedin_website)
-    if not original_domain or not linkedin_domain:
-        return "NOT VERIFIED"
-    return "YES" if original_domain == linkedin_domain else "NO"
-
-
-def calculate_confidence(score, linkedin_website, match):
-    if linkedin_website and match == "YES":
-        return "VERY HIGH"
-    if linkedin_website and match == "NO":
-        if score >= 15:
-            return "HIGH - WEBSITE MISMATCH"
-        if score >= 8:
-            return "MEDIUM - WEBSITE MISMATCH"
-        return "LOW - WEBSITE MISMATCH"
-    if score >= 20:
-        return "HIGH"
-    if score >= 12:
-        return "MEDIUM"
-    if score >= 6:
-        return "LOW - TOP MATCH"
-    return "VERY LOW - TOP MATCH"
-
-
-# ----------------------------- PROCESS ONE APP -----------------------------
-
-def process_app(bundle_id, developer1, developer2, website, support_email, developer_email):
-    bundle_id = clean_input(bundle_id)
-    developer1 = clean_input(developer1)
-    developer2 = clean_input(developer2)
-    website = normalize_website(website)
-    support_email = normalize_email(support_email)
-    developer_email = normalize_email(developer_email)
-
-    cache_key = (
-        bundle_id.lower(), developer1.lower(), developer2.lower(),
-        website.lower(), support_email.lower(), developer_email.lower()
-    )
-    if cache_key in COMPANY_RESULT_CACHE:
-        cached = COMPANY_RESULT_CACHE[cache_key].copy()
-        cached["Cache"] = "HIT"
-        return cached
-
-    direct_results = search_website_directly(website) if website else []
-
-    if direct_results:
-        linkedin = direct_results[0]["linkedin"]
-        found_via = "WEBSITE_DIRECT"
-        score, reasons = score_candidate(
-            linkedin=linkedin,
-            developer1=developer1,
-            developer2=developer2,
-            website=website,
-            support_email=support_email,
-            developer_email=developer_email,
-            title="",
-            href=linkedin,
-            body="",
-            found_via="WEBSITE_DIRECT",
-        )
-        # Preserve the original script's additional +10 for direct discovery.
-        score += 10
-        if "LinkedIn found directly on developer website" not in reasons:
-            reasons.append("LinkedIn found directly on developer website")
-        matched_signal = website
-    else:
-        candidates = find_candidates(
-            developer1, developer2, website, support_email, developer_email
-        )
-        if not candidates:
-            result = {
-                "Bundle ID": bundle_id,
-                "Developer 1": developer1,
-                "Developer 2": developer2,
-                "Website": website,
-                "LinkedIn": "NOT FOUND",
-                "LinkedIn Website": "",
-                "Website Match": "NOT VERIFIED",
-                "Found Via": "",
-                "Matched Signal": "",
-                "Score": 0,
-                "Confidence": "NOT FOUND",
-                "Reasons": "No LinkedIn company candidate found",
-                "Cache": "MISS",
-            }
-            COMPANY_RESULT_CACHE[cache_key] = result.copy()
-            return result
-
-        candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
-        best = candidates[0]
-        linkedin = best["linkedin"]
-        score = best["score"]
-        reasons = list(dict.fromkeys(best["reasons"]))
-        found_via = best["found_via"]
-        matched_signal = best["matched_signal"]
-
-    linkedin_website = find_linkedin_website(linkedin)
-    match = website_match(website, linkedin_website)
-    confidence = calculate_confidence(score, linkedin_website, match)
-
-    if match == "YES":
-        reasons.append("LinkedIn website matches original website")
-    elif match == "NO":
-        reasons.append("LinkedIn website does not match original website")
-    else:
-        reasons.append("LinkedIn website could not be independently verified")
-
-    result = {
-        "Bundle ID": bundle_id,
-        "Developer 1": developer1,
-        "Developer 2": developer2,
-        "Website": website,
-        "LinkedIn": linkedin,
-        "LinkedIn Website": linkedin_website,
-        "Website Match": match,
-        "Found Via": found_via,
-        "Matched Signal": matched_signal,
-        "Score": score,
-        "Confidence": confidence,
-        "Reasons": " | ".join(dict.fromkeys(reasons)),
-        "Cache": "MISS",
-    }
-    COMPANY_RESULT_CACHE[cache_key] = result.copy()
-    return result
-
-
 # ----------------------------- MAIN WORKER LOOP -----------------------------
 
 def main():
@@ -695,7 +2192,12 @@ def main():
             support_email = clean_input(row.get("support_email"))
             developer_email = clean_input(row.get("developer_email"))
 
-            print(f"\n[{processed_this_run + 1}] Processing {bundle_id}")
+            print(f"\\n[{processed_this_run + 1}] Processing {bundle_id}")
+            print(f"   Developer 1: {developer1}")
+            print(f"   Developer 2: {developer2}")
+            print(f"   Website: {website}")
+            print(f"   Support Email: {support_email}")
+            print(f"   Developer Email: {developer_email}")
 
             try:
                 result = process_app(
@@ -707,6 +2209,10 @@ def main():
                     developer_email=developer_email,
                 )
                 save_app_result(app_id, result, status="completed")
+                print(f"   LinkedIn: {result.get('LinkedIn', '')}")
+                print(f"   Found Via: {result.get('Found Via', '')}")
+                print(f"   Score: {result.get('Score', 0)}")
+                print(f"   Confidence: {result.get('Confidence', '')}")
             except Exception as exc:
                 error_text = f"{type(exc).__name__}: {str(exc)[:800]}"
                 print(f"App error for {bundle_id}: {error_text}")
@@ -721,18 +2227,19 @@ def main():
                     "Reasons": error_text,
                     "Cache": "ERROR",
                 }
-                # Mark this row as error so the worker does not retry it forever.
                 save_app_result(
-                    app_id, error_result, status="error",
-                    error_message=error_text
+                    app_id,
+                    error_result,
+                    status="error",
+                    error_message=error_text,
                 )
 
             processed_this_run += 1
             update_job(processed_rows=processed_this_run)
 
-            time.sleep(random.uniform(MIN_APP_DELAY, MAX_APP_DELAY))
+            if processed_this_run:
+                time.sleep(random.uniform(MIN_APP_DELAY, MAX_APP_DELAY))
 
-    # Count completed and errored rows for this job.
     all_rows = db_request(
         "GET",
         "research_apps",
@@ -742,9 +2249,11 @@ def main():
             "limit": "10000",
         },
     ) or []
-    finished = sum(1 for item in all_rows if item.get("status") in ("completed", "error"))
+    finished = sum(
+        1 for item in all_rows
+        if item.get("status") in ("completed", "error")
+    )
     total = len(all_rows)
-
     final_status = "completed" if finished >= total else "failed"
     update_job(status=final_status, processed_rows=finished)
     print(f"Worker finished. {finished}/{total} rows completed or errored.")
