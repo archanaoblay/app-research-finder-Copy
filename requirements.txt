@@ -4,3 +4,4 @@ tldextract
 ddgs
 openpyxl
 pandas
+google-play-scraper
