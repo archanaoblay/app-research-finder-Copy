@@ -2080,71 +2080,210 @@ def process_app(
 
 
 
-# ----------------------------- GOOGLE PLAY ENRICHMENT -----------------------------
+# ----------------------------- MULTI-SOURCE ENRICHMENT -----------------------------
 
 GOOGLE_PLAY_CACHE = {}
-# Google Play country parameter uses ISO 3166-1 alpha-2 country codes.
-# Start with common markets, then try the remaining ISO country codes.
+ENRICHMENT_CACHE = {}
 GOOGLE_PLAY_PRIORITY_COUNTRIES = ["in", "us", "gb", "ca", "au", "sg", "id", "ph", "my", "th", "vn", "br", "mx", "de", "fr", "jp", "kr", "ae", "sa"]
-GOOGLE_PLAY_ALL_COUNTRIES = "aw af ao ai ax al ad ae ar am as aq tf ag au at az bi be bj bq bf bd bg bh bs ba bl by bz bm bo br bb bn bt bv bw cf ca cc ch cl cn ci cm cd cg ck co km cv cr cu cw cx ky cy cz de dj dm dk do dz ec eg er eh es ee et fi fj fk fr fo fm ga gb ge gg gh gi gn gp gm gw gq gr gd gl gt gf gu gy hk hm hn hr ht hu id im in io ie ir iq is il it jm je jo jp kz ke kg kh ki kn kr kw la lb lr ly lc li lk ls lt lu lv mo mf ma mc md mg mv mx mh mk ml mt mm me mn mp mz mr ms mq mu mw my yt na nc ne nf ng ni nu nl no np nr nz om pk pa pn pe ph pw pg pl pr kp pt py ps pf qa re ro ru rw sa sd sn sg gs sh sj sb sl sv sm so pm rs ss st sr sk si se sz sx sc sy tc td tg th tj tk tm tl to tt tn tr tv tw tz ug ua um uy us uz va vc ve vg vi vn vu wf ws ye za zm zw".split()
-GOOGLE_PLAY_COUNTRIES = GOOGLE_PLAY_PRIORITY_COUNTRIES + [
-    code for code in GOOGLE_PLAY_ALL_COUNTRIES if code not in GOOGLE_PLAY_PRIORITY_COUNTRIES
-]
+GOOGLE_PLAY_ALL_COUNTRIES = "aw af ao ai ax al ad ae ar am as aq tf ag au at az bi be bj bq bf bd bh bs ba bl by bz bm bo br bb bn bt bv bw cf ca cc ch cl cm cn ci ck co km cv cr cu cw cx ky cy cz de dj dm dk do dz ec eg er es ee et fi fj fk fo fm ga gb ge gg gh gi gn gp gm gw gq gr gd gl gt gf gu gy hk hm hn hr ht hu id im in io ie ir iq is il jm je jo jp kz ke kg kh ki kn kr kw la lb lr ly lc li lk ls lt lu mo mf ma mc md mv mh mk ml mt mm me mn mz mr ms mq mu mw my yt na nc ne nf ng ni nu nl np nr nz om pk pa pe ph pw pg pl pr pt py ps pf qa re ro rw sa sd sn sg sh sb sl sv sm so pm rs ss st sr sk si sz sx sc sy tc td tg th tj tk tm tl to tt tn tr tv tw tz ug ua um uy us uz vc ve vg vi vn vu wf ws ye za zm zw".split()
+GOOGLE_PLAY_COUNTRIES = GOOGLE_PLAY_PRIORITY_COUNTRIES + [c for c in GOOGLE_PLAY_ALL_COUNTRIES if c not in GOOGLE_PLAY_PRIORITY_COUNTRIES]
 
 
-def get_google_play_details(bundle_id):
-    """Find an app in Google Play across supported country storefronts."""
+def row_value(row, *names):
+    """Read user-supplied columns from DB fields or original uploaded input_data."""
+    data = row.get("input_data") if isinstance(row.get("input_data"), dict) else {}
+    normalized = {re.sub(r"[^a-z0-9]", "", str(k).lower()): v for k, v in data.items()}
+    for name in names:
+        key = re.sub(r"[^a-z0-9]", "", name.lower())
+        value = clean_input(row.get(name))
+        if not value:
+            value = clean_input(normalized.get(key))
+        if value:
+            return value
+    return ""
+
+
+def google_play_lookup(bundle_id):
     bundle_id = clean_input(bundle_id)
     if not bundle_id:
         return {}, "missing_bundle_id"
-
-    cache_key = bundle_id.lower()
-    if cache_key in GOOGLE_PLAY_CACHE:
-        return GOOGLE_PLAY_CACHE[cache_key], "cache_hit"
-
-    last_error = "not_found_in_checked_regions"
-    checked = 0
-    for country in GOOGLE_PLAY_COUNTRIES:
-        checked += 1
+    key = bundle_id.lower()
+    if key in GOOGLE_PLAY_CACHE:
+        return GOOGLE_PLAY_CACHE[key], "cache_hit"
+    last_error = "not_found"
+    for index, country in enumerate(GOOGLE_PLAY_COUNTRIES, 1):
         try:
-            # google-play-scraper's app() does not accept a timeout argument.
             details = google_play_app(bundle_id, lang="en", country=country)
             if details:
-                GOOGLE_PLAY_CACHE[cache_key] = details
-                print(f"Google Play found {bundle_id} in storefront {country.upper()} after {checked} region checks")
+                GOOGLE_PLAY_CACHE[key] = details
+                print(f"   Google Play listing found in {country.upper()} after {index} region checks")
                 return details, f"found:{country}"
         except Exception as exc:
-            last_error = f"{type(exc).__name__}: {str(exc)[:180]}"
-            # Not-found/region-unavailable errors are expected during a global scan.
-            # Print periodic diagnostics instead of flooding the Actions log.
-            if checked == 1 or checked % 25 == 0:
-                print(f"Google Play scan {checked}/{len(GOOGLE_PLAY_COUNTRIES)} for {bundle_id}; latest {country.upper()} response: {last_error}")
+            last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+            if index == 1 or index % 30 == 0:
+                print(f"   Google Play region scan {index}/{len(GOOGLE_PLAY_COUNTRIES)}; latest error: {last_error}")
+    return {}, f"not_found_after_{len(GOOGLE_PLAY_COUNTRIES)}_regions; {last_error}"
 
-    status = f"not_found_after_{checked}_regions; last_error={last_error}"
-    print(f"Google Play did not return {bundle_id} in {checked} checked country storefronts")
-    return {}, status
+
+def website_research(website):
+    """Inspect only the supplied/Google Play official domain and common company pages."""
+    base = normalize_website(website)
+    if not base:
+        return {"emails": [], "text": "", "pages": [], "legal_names": []}
+    domain = root_domain(base)
+    paths = ["", "about", "about-us", "company", "contact", "contact-us", "privacy", "privacy-policy", "terms", "terms-of-service"]
+    emails, texts, visited, legal_names = set(), [], [], set()
+    for path in paths:
+        url = base if not path else urllib.parse.urljoin(base + "/", path)
+        try:
+            response = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            if response.status_code >= 400 or not response.text:
+                continue
+            soup = BeautifulSoup(response.text[:1_500_000], "html.parser")
+            for a in soup.select('a[href^="mailto:"]'):
+                email = normalize_email(a.get("href", "").replace("mailto:", "").split("?")[0])
+                if email and "@" in email:
+                    emails.add(email)
+            text_content = soup.get_text(" ", strip=True)
+            texts.append(text_content[:25000])
+            visited.append(response.url)
+            for match in re.findall(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", response.text, re.I):
+                email = normalize_email(match)
+                if email and "@" in email:
+                    emails.add(email)
+            # Capture explicit legal/copyright/operator names only; do not guess from arbitrary text.
+            patterns = [
+                r"(?:©|copyright)\s*(?:\d{4}\s*)?([^|.\n]{2,100})",
+                r"(?:operated|published|owned)\s+by\s+([A-Z][A-Za-z0-9&,.()' \-]{2,90})",
+                r"(?:a product of|a subsidiary of)\s+([A-Z][A-Za-z0-9&,.()' \-]{2,90})",
+            ]
+            for pattern in patterns:
+                for candidate in re.findall(pattern, text_content, re.I):
+                    candidate = re.sub(r"\s+", " ", candidate).strip(" -|,:;")
+                    if 3 <= len(candidate) <= 90 and not candidate.lower().startswith(("all rights", "all trademarks")):
+                        legal_names.add(candidate)
+        except Exception:
+            continue
+    combined = " ".join(texts)
+    return {"emails": sorted(emails), "text": combined[:60000], "pages": visited, "legal_names": sorted(legal_names)}
+
+
+def free_search_enrichment(app_name, developer, website):
+    """Use free public search results to discover missing official company details."""
+    queries = []
+    if developer and website:
+        queries.append(f'"{developer}" "{root_domain(website)}" contact email')
+    if developer:
+        queries.append(f'"{developer}" official website contact email')
+    if app_name and developer:
+        queries.append(f'"{app_name}" "{developer}" publisher company')
+    results = []
+    for query in queries[:3]:
+        results.extend(search_web(query, max_results=4))
+    return results
 
 
 def enrich_from_google_play(row):
-    """Fill missing fields from Google Play while preserving supplied values."""
-    bundle_id = clean_input(row.get("bundle_id"))
-    details, lookup_status = get_google_play_details(bundle_id)
-    enriched = {
-        "developer_1": clean_input(row.get("developer_1")) or clean_input(details.get("developer")),
-        # Google Play does not provide a second developer entity; never infer one.
-        "developer_2": clean_input(row.get("developer_2")),
-        "website": clean_input(row.get("website")) or clean_input(details.get("developerWebsite")),
-        "support_email": clean_input(row.get("support_email")) or clean_input(details.get("developerEmail")),
-        "developer_email": clean_input(row.get("developer_email")) or clean_input(details.get("developerEmail")),
-    }
+    """Use supplied values first, then Google Play, official website and free search."""
+    bundle_id = row_value(row, "bundle_id", "Bundle ID", "Package Name", "App ID")
+    app_name = row_value(row, "app_name", "App Name", "Application Name", "Title")
+    developer1 = row_value(row, "developer_1", "Developer 1", "Developer", "Developer Name", "Publisher")
+    developer2 = row_value(row, "developer_2", "Developer 2", "Parent Company", "Publisher Company")
+    website = row_value(row, "website", "Developer Website", "Company Website", "Website", "URL")
+    support_email = row_value(row, "support_email", "Support Email", "App Support Email")
+    developer_email = row_value(row, "developer_email", "Developer Email", "Business Email", "Contact Email")
+
+    supplied = {"app_name": bool(app_name), "developer_1": bool(developer1), "developer_2": bool(developer2), "website": bool(website), "support_email": bool(support_email), "developer_email": bool(developer_email)}
+    field_sources = {key: ("user_input" if supplied[key] else "not_found") for key in supplied}
+    gp_details, gp_status = ({}, "skipped_all_core_fields_supplied")
+    # Skip the expensive regional scan when the user already supplied the core identity and website.
+    if not (app_name and developer1 and website):
+        gp_details, gp_status = google_play_lookup(bundle_id)
+        if not app_name and clean_input(gp_details.get("title")):
+            app_name = clean_input(gp_details.get("title")); field_sources["app_name"] = "google_play"
+        if not developer1 and clean_input(gp_details.get("developer")):
+            developer1 = clean_input(gp_details.get("developer")); field_sources["developer_1"] = "google_play"
+        if not website and clean_input(gp_details.get("developerWebsite")):
+            website = clean_input(gp_details.get("developerWebsite")); field_sources["website"] = "google_play"
+        if not support_email and clean_input(gp_details.get("developerEmail")):
+            support_email = clean_input(gp_details.get("developerEmail")); field_sources["support_email"] = "google_play_developer_email"
+
+    website_data = website_research(website) if website else {"emails": [], "text": "", "pages": [], "legal_names": []}
+    emails = website_data["emails"]
+    text_blob = website_data["text"].lower()
+
+    # Only classify emails when evidence is available from the official site.
+    if not support_email:
+        support_candidates = [e for e in emails if any(k in e.lower() for k in ("support", "help", "care", "service"))]
+        if support_candidates:
+            support_email = support_candidates[0]
+            field_sources["support_email"] = "official_website"
+    if not developer_email:
+        business_candidates = [e for e in emails if not any(k in e.lower() for k in ("support", "help", "noreply", "no-reply"))]
+        if business_candidates:
+            developer_email = business_candidates[0]
+            field_sources["developer_email"] = "official_website"
+
+    # Developer 2 only from explicit user input or clear legal/ownership evidence.
+    if not developer2 and developer1:
+        for legal_name in website_data["legal_names"]:
+            if legal_name.casefold() != developer1.casefold() and len(legal_name) >= 4:
+                developer2 = legal_name
+                field_sources["developer_2"] = "official_website_legal_text"
+                break
+
+    search_results = []
+    if not (developer2 and support_email and developer_email):
+        search_results = free_search_enrichment(app_name, developer1, website)
+        snippets = " ".join(str(x.get("body", "")) + " " + str(x.get("title", "")) for x in search_results)
+        # Search-derived email addresses are accepted only when tied to the known company domain.
+        company_domain = root_domain(website)
+        found_emails = {normalize_email(e) for e in re.findall(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", snippets, re.I)}
+        found_emails = {e for e in found_emails if e and (not company_domain or email_domain(e) == company_domain)}
+        if not support_email:
+            support_hits = sorted(e for e in found_emails if any(k in e for k in ("support", "help", "care")))
+            if support_hits:
+                support_email = support_hits[0]
+                field_sources["support_email"] = "public_search_result"
+        if not developer_email:
+            other_hits = sorted(e for e in found_emails if not any(k in e for k in ("support", "help", "noreply", "no-reply")))
+            if other_hits:
+                developer_email = other_hits[0]
+                field_sources["developer_email"] = "public_search_result"
+        if not developer2:
+            for result in search_results:
+                title = clean_input(result.get("title", ""))
+                body = clean_input(result.get("body", ""))
+                match = re.search(r"(?:owned by|operated by|published by|subsidiary of|part of)\s+([A-Z][A-Za-z0-9&,.()' \-]{2,80})", body, re.I)
+                candidate = clean_input(match.group(1)) if match else ""
+                if candidate and candidate.casefold() != developer1.casefold():
+                    developer2 = candidate
+                    field_sources["developer_2"] = "public_search_result_ownership_reference"
+                    break
+
     metadata = {
-        "google_play_app_name": clean_input(details.get("title")),
-        "google_play_developer": clean_input(details.get("developer")),
-        "google_play_developer_id": clean_input(details.get("developerId")),
-        "google_play_developer_website": clean_input(details.get("developerWebsite")),
-        "google_play_developer_email": clean_input(details.get("developerEmail")),
-        "google_play_lookup_status": lookup_status,
-        "google_play_url": f"https://play.google.com/store/apps/details?id={urllib.parse.quote(bundle_id)}",
+        "app_name": app_name,
+        "google_play_app_name": clean_input(gp_details.get("title")),
+        "google_play_developer": clean_input(gp_details.get("developer")),
+        "google_play_developer_id": clean_input(gp_details.get("developerId")),
+        "google_play_developer_website": clean_input(gp_details.get("developerWebsite")),
+        "google_play_developer_email": clean_input(gp_details.get("developerEmail")),
+        "google_play_lookup_status": gp_status,
+        "google_play_url": f"https://play.google.com/store/apps/details?id={urllib.parse.quote(bundle_id)}" if bundle_id else "",
+        "enrichment_website_pages_checked": website_data["pages"],
+        "enrichment_website_legal_names": website_data["legal_names"],
+        "enrichment_emails_found": emails,
+        "enrichment_search_results_count": len(search_results),
+        "enrichment_supplied_fields": supplied,
+        "enrichment_field_sources": field_sources,
+    }
+    enriched = {
+        "app_name": app_name,
+        "developer_1": developer1,
+        "developer_2": developer2,
+        "website": normalize_website(website),
+        "support_email": normalize_email(support_email),
+        "developer_email": normalize_email(developer_email),
     }
     return enriched, metadata
 
