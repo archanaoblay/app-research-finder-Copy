@@ -2083,29 +2083,46 @@ def process_app(
 # ----------------------------- GOOGLE PLAY ENRICHMENT -----------------------------
 
 GOOGLE_PLAY_CACHE = {}
-GOOGLE_PLAY_COUNTRIES = ["in", "us"]
+# Google Play country parameter uses ISO 3166-1 alpha-2 country codes.
+# Start with common markets, then try the remaining ISO country codes.
+GOOGLE_PLAY_PRIORITY_COUNTRIES = ["in", "us", "gb", "ca", "au", "sg", "id", "ph", "my", "th", "vn", "br", "mx", "de", "fr", "jp", "kr", "ae", "sa"]
+GOOGLE_PLAY_ALL_COUNTRIES = "aw af ao ai ax al ad ae ar am as aq tf ag au at az bi be bj bq bf bd bg bh bs ba bl by bz bm bo br bb bn bt bv bw cf ca cc ch cl cn ci cm cd cg ck co km cv cr cu cw cx ky cy cz de dj dm dk do dz ec eg er eh es ee et fi fj fk fr fo fm ga gb ge gg gh gi gn gp gm gw gq gr gd gl gt gf gu gy hk hm hn hr ht hu id im in io ie ir iq is il it jm je jo jp kz ke kg kh ki kn kr kw la lb lr ly lc li lk ls lt lu lv mo mf ma mc md mg mv mx mh mk ml mt mm me mn mp mz mr ms mq mu mw my yt na nc ne nf ng ni nu nl no np nr nz om pk pa pn pe ph pw pg pl pr kp pt py ps pf qa re ro ru rw sa sd sn sg gs sh sj sb sl sv sm so pm rs ss st sr sk si se sz sx sc sy tc td tg th tj tk tm tl to tt tn tr tv tw tz ug ua um uy us uz va vc ve vg vi vn vu wf ws ye za zm zw".split()
+GOOGLE_PLAY_COUNTRIES = GOOGLE_PLAY_PRIORITY_COUNTRIES + [
+    code for code in GOOGLE_PLAY_ALL_COUNTRIES if code not in GOOGLE_PLAY_PRIORITY_COUNTRIES
+]
 
 
 def get_google_play_details(bundle_id):
-    """Fetch public app listing metadata from Google Play only."""
+    """Find an app in Google Play across supported country storefronts."""
     bundle_id = clean_input(bundle_id)
     if not bundle_id:
         return {}, "missing_bundle_id"
+
     cache_key = bundle_id.lower()
     if cache_key in GOOGLE_PLAY_CACHE:
         return GOOGLE_PLAY_CACHE[cache_key], "cache_hit"
-    last_error = "not_found"
+
+    last_error = "not_found_in_checked_regions"
+    checked = 0
     for country in GOOGLE_PLAY_COUNTRIES:
+        checked += 1
         try:
-            details = google_play_app(bundle_id, lang="en", country=country, timeout=20)
+            # google-play-scraper's app() does not accept a timeout argument.
+            details = google_play_app(bundle_id, lang="en", country=country)
             if details:
                 GOOGLE_PLAY_CACHE[cache_key] = details
-                return details, "found"
+                print(f"Google Play found {bundle_id} in storefront {country.upper()} after {checked} region checks")
+                return details, f"found:{country}"
         except Exception as exc:
-            last_error = f"{type(exc).__name__}: {str(exc)[:250]}"
-            print(f"Google Play lookup ({country}) failed for {bundle_id}: {last_error}")
-            time.sleep(1)
-    return {}, last_error
+            last_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+            # Not-found/region-unavailable errors are expected during a global scan.
+            # Print periodic diagnostics instead of flooding the Actions log.
+            if checked == 1 or checked % 25 == 0:
+                print(f"Google Play scan {checked}/{len(GOOGLE_PLAY_COUNTRIES)} for {bundle_id}; latest {country.upper()} response: {last_error}")
+
+    status = f"not_found_after_{checked}_regions; last_error={last_error}"
+    print(f"Google Play did not return {bundle_id} in {checked} checked country storefronts")
+    return {}, status
 
 
 def enrich_from_google_play(row):
